@@ -1,0 +1,253 @@
+# main.py (Canonical) — TrustFedAvg-Fuzzy with optional threshold τ
+
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from copy import deepcopy
+
+from dataset import prepare_data
+from model import Net, get_weights, set_weights
+from plot_utils import (
+    get_predictions_and_metrics,
+    plot_confusion_matrix,
+    plot_final_metrics_bar_chart,
+    plot_trust_dynamics
+)
+from fuzzy_trust import compute_fuzzy_trust
+
+# ---------------------- Config ----------------------
+NUM_CLIENTS = 10
+NUM_ROUNDS = 20
+LOCAL_EPOCHS = 5
+CENTRALIZED_EPOCHS = 20
+TAU = 0.20  # threshold for hard exclusion
+
+# ---------------------- Data ------------------------
+trainloaders, valloader, trainloader_centralized, input_size, num_classes, class_names = prepare_data(num_clients=NUM_CLIENTS)
+
+if isinstance(class_names, (list, tuple)) and 'normal' in class_names:
+    NORMAL_CLASS_ID = int(class_names.index('normal'))
+else:
+    NORMAL_CLASS_ID = 0
+
+# ---------------------- Centralized -----------------
+print("--- Training Centralized Model ---")
+centralized_model = Net(input_size, num_classes)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(centralized_model.parameters(), lr=0.001)
+
+centralized_model.train()
+for epoch in range(CENTRALIZED_EPOCHS):
+    for features, labels in trainloader_centralized:
+        optimizer.zero_grad()
+        loss = criterion(centralized_model(features), labels)
+        loss.backward()
+        optimizer.step()
+    print(f"Centralized Epoch {epoch+1}/{CENTRALIZED_EPOCHS} complete.")
+
+# ---------------------- FL Core ---------------------
+def run_simulation(mode="FedAvg"):
+    """
+    mode ∈ {"FedAvg", "TrustFedAvg", "TrustFedAvg-Threshold"}
+    """
+    print(f"\n--- Starting {mode} Simulation ---")
+    global_model = Net(input_size, num_classes)
+    history = []
+    trust_history = []           # list of np.array(K,) per round (only for Trust*)
+    exclusion_records = []       # list of dict {round, num_excluded, excluded_ids}
+
+    for t in range(NUM_ROUNDS):
+        client_updates, client_ns = [], []
+        f1_list, dev_list, ar_list = [], [], []
+        global_weights = get_weights(global_model)
+
+        # local updates
+        for k in range(NUM_CLIENTS):
+            client_net = deepcopy(global_model)
+            set_weights(client_net, global_weights)
+            opt = torch.optim.Adam(client_net.parameters(), lr=0.001)
+
+            client_net.train()
+            for _ in range(LOCAL_EPOCHS):
+                for feats, lbls in trainloaders[k]:
+                    opt.zero_grad()
+                    loss = criterion(client_net(feats), lbls)
+                    loss.backward()
+                    opt.step()
+
+            client_updates.append(get_weights(client_net))
+            client_ns.append(len(trainloaders[k].dataset))
+
+            if mode in ["TrustFedAvg", "TrustFedAvg-Threshold"]:
+                # 1) validation macro-F1 on server val
+                m, _ = get_predictions_and_metrics(client_net, valloader, class_names)
+                f1_list.append(float(m["macro_f1"]))
+                # 2) normalized deviation δ_k
+                cu = np.concatenate([w.flatten() for w in get_weights(client_net)])
+                gu = np.concatenate([w.flatten() for w in global_weights])
+                dev = np.linalg.norm(cu - gu) / (np.linalg.norm(gu) + 1e-8)
+                dev_list.append(float(dev))
+                # 3) attack ratio a_k
+                all_labels = []
+                for _, loc_lbls in trainloaders[k]:
+                    all_labels.extend(loc_lbls.numpy())
+                a_k = float(np.mean(np.array(all_labels) != NORMAL_CLASS_ID))
+                ar_list.append(a_k)
+
+        client_ns = np.array(client_ns, dtype=float)
+
+        # aggregation weights
+        if mode in ["TrustFedAvg", "TrustFedAvg-Threshold"]:
+            dev_arr = np.array(dev_list, dtype=float)
+            if dev_arr.size > 0:
+                dev_norm01 = (dev_arr - dev_arr.min()) / (np.ptp(dev_arr) + 1e-8)
+                dev_for_fuzzy = 2.0 * np.clip(dev_norm01, 0.0, 1.0)  # universe [0,2]
+            else:
+                dev_for_fuzzy = dev_arr
+            f1_arr = np.array(f1_list, dtype=float)
+            ar_arr = np.array(ar_list, dtype=float)
+
+            client_trusts = np.array([
+                compute_fuzzy_trust(f1_arr[i], dev_for_fuzzy[i], ar_arr[i])
+                for i in range(len(f1_arr))
+            ], dtype=float)
+            trust_history.append(client_trusts.copy())
+
+            if mode == "TrustFedAvg-Threshold":
+                mask = client_trusts >= TAU
+                excluded_ids = [int(i) for i in np.where(~mask)[0]]
+                eff_trusts = client_trusts.copy()
+                eff_trusts[~mask] = 0.0
+                exclusion_records.append({
+                    "round": t+1,
+                    "num_excluded": int((~mask).sum()),
+                    "excluded_ids": excluded_ids
+                })
+            else:
+                eff_trusts = client_trusts.copy()
+                exclusion_records.append({
+                    "round": t+1,
+                    "num_excluded": 0,
+                    "excluded_ids": []
+                })
+
+            props = client_ns * eff_trusts
+            props = props / props.sum() if props.sum() > 0 else (client_ns / client_ns.sum())
+        else:
+            props = client_ns / client_ns.sum()
+
+        # weighted sum of weights
+        L = len(get_weights(global_model))
+        new_weights = [
+            sum(props[i] * layer[iL] for i, layer in enumerate(client_updates))
+            for iL in range(L)
+        ]
+        set_weights(global_model, new_weights)
+
+        # round metrics on server val
+        met, _ = get_predictions_and_metrics(global_model, valloader, class_names)
+        if mode in ["TrustFedAvg", "TrustFedAvg-Threshold"] and trust_history:
+            met["avg_trust"] = float(np.mean(trust_history[-1]))
+            met["num_excluded"] = exclusion_records[-1]["num_excluded"]
+        history.append(met)
+        print(f"  > Round {t+1}/{NUM_ROUNDS}  Acc={met['accuracy']:.4f}  F1={met['macro_f1']:.4f}")
+
+    return global_model, history, (trust_history if mode in ["TrustFedAvg", "TrustFedAvg-Threshold"] else None), exclusion_records
+
+# ---------------------- Run -------------------------
+fedavg_model, fedavg_hist, _, _ = run_simulation("FedAvg")
+trust_model, trust_hist, trust_hist_mat, excl_no_tau = run_simulation("TrustFedAvg")
+trust_tau_model, trust_tau_hist, trust_tau_hist_mat, excl_tau = run_simulation("TrustFedAvg-Threshold")
+
+# ---------------------- Final eval ------------------
+print("\n--- Final Evaluation ---")
+m_cent, cm_cent = get_predictions_and_metrics(centralized_model, valloader, class_names)
+m_fed,  cm_fed  = get_predictions_and_metrics(fedavg_model,      valloader, class_names)
+m_tr,   cm_tr   = get_predictions_and_metrics(trust_model,       valloader, class_names)
+m_trt,  cm_trt  = get_predictions_and_metrics(trust_tau_model,   valloader, class_names)
+
+# ---------------------- Excel exports ----------------
+with pd.ExcelWriter("publication_results.xlsx") as w:
+    # Final metrics table
+    df_fin = pd.DataFrame({
+        "Metric": ["Accuracy","Macro F1-Score","Weighted F1-Score","Macro Precision","Macro Recall"],
+        "Centralized":   [m_cent["accuracy"], m_cent["macro_f1"], m_cent["weighted_f1"], m_cent["macro_precision"], m_cent["macro_recall"]],
+        "FedAvg":        [m_fed["accuracy"],  m_fed["macro_f1"],  m_fed["weighted_f1"],  m_fed["macro_precision"],  m_fed["macro_recall"]],
+        "TrustFedAvg-Fuzzy": [m_tr["accuracy"], m_tr["macro_f1"], m_tr["weighted_f1"], m_tr["macro_precision"], m_tr["macro_recall"]],
+        f"TrustFedAvg-Fuzzy(τ={TAU:.2f})": [m_trt["accuracy"], m_trt["macro_f1"], m_trt["weighted_f1"], m_trt["macro_precision"], m_trt["macro_recall"]],
+    }).set_index("Metric")
+    df_fin.to_excel(w, sheet_name="Final_Metrics_Comparison")
+
+    # Delta (τ – no-τ)
+    col_tau = f"TrustFedAvg-Fuzzy(τ={TAU:.2f})"
+    df_delta = df_fin[col_tau] - df_fin["TrustFedAvg-Fuzzy"]
+    df_delta.to_excel(w, sheet_name="Final_Metrics_Delta")
+
+    # Round histories
+    pd.DataFrame(fedavg_hist).to_excel(w, sheet_name="FedAvg_Round_History", index=False)
+    pd.DataFrame(trust_hist).to_excel(w, sheet_name="TrustFedAvg_Round_History", index=False)
+    pd.DataFrame(trust_tau_hist).to_excel(w, sheet_name="TrustFedAvg_Tau_Round_History", index=False)
+
+    # Client trust distribution (final)
+    # recompute attack ratio per client (once)
+    attack_ratios = []
+    for k in range(NUM_CLIENTS):
+        labs = []
+        for _, lab in trainloaders[k]:
+            labs.extend(lab.numpy())
+        attack_ratios.append(float(np.mean(np.array(labs) != NORMAL_CLASS_ID)))
+
+    final_trust_no_tau = trust_hist_mat[-1] if trust_hist_mat else []
+    final_trust_tau    = trust_tau_hist_mat[-1] if trust_tau_hist_mat else []
+    pd.DataFrame({
+        "Client_ID": list(range(NUM_CLIENTS)),
+        "Attack_Ratio": attack_ratios,
+        "Final_Trust": final_trust_no_tau if len(final_trust_no_tau)>0 else [np.nan]*NUM_CLIENTS,
+        "Final_Trust_tau": final_trust_tau if len(final_trust_tau)>0 else [np.nan]*NUM_CLIENTS
+    }).to_excel(w, sheet_name="Client_Trust_Distribution", index=False)
+
+    # Trust histories (per round × client) — store as matrices
+    if trust_hist_mat:
+        pd.DataFrame(trust_hist_mat, index=range(1, len(trust_hist_mat)+1)).to_excel(w, sheet_name="Trust_History")
+    if trust_tau_hist_mat:
+        pd.DataFrame(trust_tau_hist_mat, index=range(1, len(trust_tau_hist_mat)+1)).to_excel(w, sheet_name="Trust_History_Tau")
+
+    # Exclusion logs
+    pd.DataFrame(excl_no_tau).to_excel(w, sheet_name="Exclusion_History_NoTau", index=False)
+    pd.DataFrame(excl_tau).to_excel(w, sheet_name="Exclusion_History_Tau", index=False)
+
+print("Results saved to publication_results.xlsx")
+
+# ---------------------- Figures ---------------------
+fig, axes = plt.subplots(3, 2, figsize=(18, 20))
+fig.suptitle("Comparative Results", fontsize=22)
+
+def plot_curve(ax, h_no, h_tau, metric, title):
+    ax.plot([r.get(metric, np.nan) for r in h_no], label="TrustFedAvg (no τ)")
+    ax.plot([r.get(metric, np.nan) for r in h_tau], label=f"TrustFedAvg (τ={TAU:.2f})")
+    ax.set_title(title); ax.set_xlabel("Round"); ax.set_ylabel(metric); ax.legend()
+
+# Learning curves
+plot_curve(axes[0,0], trust_hist,     trust_tau_hist,     "accuracy",  "Accuracy vs. Rounds")
+plot_curve(axes[0,1], trust_hist,     trust_tau_hist,     "macro_f1",  "Macro-F1 vs. Rounds")
+
+# Final metrics (no-τ) bar chart + confusion matrices (τ)
+plot_final_metrics_bar_chart(axes[1,0], m_cent, m_fed, m_tr)
+axes[1,0].set_title("Final Metrics (Centralized / FedAvg / TrustFedAvg (no τ))")
+
+plot_confusion_matrix(axes[1,1], cm_trt, class_names, f"Confusion Matrix — TrustFedAvg (τ={TAU:.2f})")
+
+# Trust dynamics (τ) + Exclusion curve (τ)
+plot_trust_dynamics(axes[2,0], trust_tau_hist_mat, NUM_CLIENTS)
+axes[2,0].set_title("Trust Dynamics per Client (τ)")
+
+excl_cnt = [e.get("num_excluded", 0) for e in excl_tau]
+axes[2,1].plot(range(1, len(excl_cnt)+1), excl_cnt, marker="o")
+axes[2,1].set_title("Clients Excluded per Round (τ)")
+axes[2,1].set_xlabel("Round"); axes[2,1].set_ylabel("# Excluded")
+
+plt.tight_layout(rect=[0,0,1,0.96])
+plt.savefig("publication_results.png", dpi=300)
+print("Figures saved to publication_results.png")
