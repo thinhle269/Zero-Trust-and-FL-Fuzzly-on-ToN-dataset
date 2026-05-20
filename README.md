@@ -20,7 +20,7 @@ Federated Learning (FL) has emerged as a vital paradigm for training machine-lea
 1. **Zero-Trust at the algorithmic layer.** Trust is enforced *inside* the federated aggregation step, not only at the network perimeter.
 2. **Dynamic fuzzy trust evaluation.** A Mamdani fuzzy inference system combines (i) server-side validation Macro-F1, (ii) the normalised deviation of the client update from the global model, and (iii) the anomaly (attack) ratio of the client's local data, producing an interpretable trust score in `[0, 1]`.
 3. **Dual soft / hard regulation.** Updates are softly down-weighted in proportion to their fuzzy trust, while a strict cut-off rule removes persistently low-trust clients from aggregation. Excluded clients are *re-admissible* once their behaviour improves, satisfying the continuous-verification principle of Zero-Trust.
-4. **Empirical validation on ToN-IoT.** Robustness against poisoning, improved minority-class recall, stable convergence under non-IID partitions, and a scalability study with K = 50 clients.
+4. **Empirical validation on ToN-IoT.** Robustness against poisoning, improved minority-class recall, stable convergence under non-IID partitions, and a scalability study with K = 10 , 50 or 100 clients, already test.
 
 ---
 
