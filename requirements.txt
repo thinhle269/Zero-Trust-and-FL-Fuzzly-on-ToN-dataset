@@ -1,0 +1,9 @@
+pandas
+numpy
+scikit-learn
+matplotlib
+torch
+flwr
+tqdm
+openpyxl
+scikit-fuzzy
